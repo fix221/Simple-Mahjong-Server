@@ -382,9 +382,13 @@ func doDiscard(p *Player, raw json.RawMessage) {
 		}
 		cand := append(append([]game.Tile{}, st.Hands[i]...), tile)
 		canP := game.CanPung(st.Hands[i], tile)
-		canW := game.CanWin(cand)
-		if st.Rule == "sichuan" && canW && !game.HasQueYiMen(cand, st.Melds[i]) {
-			canW = false
+		// 推倒胡只允许自摸，点炮不算；四川仍可点炮（需缺一门）
+		canW := false
+		if st.Rule == "sichuan" {
+			canW = game.CanWin(cand)
+			if canW && !game.HasQueYiMen(cand, st.Melds[i]) {
+				canW = false
+			}
 		}
 		if canP || canW {
 			need = true
@@ -436,11 +440,16 @@ func doAction(p *Player, raw json.RawMessage) {
 		reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat]})
 		broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": len(st.Wall)})
 	case "win":
+		// 推倒胡禁止点炮，只能 self_win
+		if st.Rule != "sichuan" {
+			reply(p.Conn, "error", map[string]string{"msg": "推倒胡只能自摸"})
+			return
+		}
 		cand := append(append([]game.Tile{}, st.Hands[seat]...), st.LastTile)
 		if !game.CanWin(cand) {
 			return
 		}
-		if st.Rule == "sichuan" && !game.HasQueYiMen(cand, st.Melds[seat]) {
+		if !game.HasQueYiMen(cand, st.Melds[seat]) {
 			reply(p.Conn, "error", map[string]string{"msg": "缺一门才能胡"})
 			return
 		}
