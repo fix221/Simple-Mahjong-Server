@@ -402,7 +402,7 @@ func pushResumeState(p *Player, r *Room, seat int) {
 	}
 	data["discards"] = disc
 	reply(p.Conn, "resume_ok", data)
-	if st.Phase == "discard" && st.Current == seat && !st.Won[seat] {
+	if st.Phase == "discard" && st.Current == seat {
 		// 补发暗杠/加杠/自摸提示
 		sendSelfOptions(r, seat)
 		reply(p.Conn, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": wallAvail(st)})
@@ -805,7 +805,7 @@ func doDiscard(p *Player, raw json.RawMessage) {
 	}
 	st := r.State
 	seat := seatOf(r, p)
-	if seat < 0 || seat != st.Current || st.Phase != "discard" || st.Won[seat] {
+	if seat < 0 || seat != st.Current || st.Phase != "discard" {
 		reply(p.Conn, "error", map[string]string{"msg": "还没轮到你出牌"})
 		return
 	}
@@ -820,6 +820,17 @@ func doDiscard(p *Player, raw json.RawMessage) {
 		}
 		if hasQue && int(tile.Suit) != st.Que[seat] {
 			reply(p.Conn, "error", map[string]string{"msg": "须先打出定缺花色的牌"})
+			return
+		}
+	}
+	if st.Won[seat] {
+		if len(st.Hands[seat]) == 0 {
+			reply(p.Conn, "error", map[string]string{"msg": "先摸牌再操作"})
+			return
+		}
+		last := st.Hands[seat][len(st.Hands[seat])-1]
+		if tile.ID() != last.ID() {
+			reply(p.Conn, "error", map[string]string{"msg": "胡过后只能打摸到的牌；自摸则直接胡牌"})
 			return
 		}
 	}
@@ -842,7 +853,7 @@ func doDiscard(p *Player, raw json.RawMessage) {
 	reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat], "melds": st.Melds[seat]})
 	need := false
 	for i := 0; i < len(r.Players); i++ {
-		if i == seat || st.Won[i] {
+		if i == seat {
 			continue
 		}
 		cand := append(append([]universal.Tile{}, st.Hands[i]...), tile)
@@ -1064,9 +1075,6 @@ func nextTurn(r *Room, after int) {
 	n := len(r.Players)
 	for k := 1; k <= n; k++ {
 		i := (after + k) % n
-		if st.Won[i] {
-			continue
-		}
 		// 离线座位跳过（等待其重连期间不卡死整桌）
 		if i < len(r.Players) && r.Players[i] != nil && !r.Players[i].Online {
 			continue
@@ -1135,7 +1143,7 @@ func sendSelfOptions(r *Room, seat int) {
 		return
 	}
 	pl := r.Players[seat]
-	if pl == nil || pl.Conn == nil || !pl.Online || st.Won[seat] {
+	if pl == nil || pl.Conn == nil || !pl.Online {
 		return
 	}
 	canWin := false
@@ -1231,7 +1239,7 @@ func doKong(p *Player, raw json.RawMessage) {
 	}
 	st := r.State
 	seat := seatOf(r, p)
-	if seat < 0 || st.Won[seat] {
+	if seat < 0 {
 		return
 	}
 	if seat != st.Current || st.Phase != "discard" {
