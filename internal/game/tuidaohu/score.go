@@ -76,3 +76,13 @@ func TotalMultiplier(horseFan, patternMul int) int {
 	}
 	return horseFan * patternMul
 }
+
+func ClampPay张(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > 12 {
+		return 12
+	}
+	return n
+}

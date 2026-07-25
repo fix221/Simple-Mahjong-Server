@@ -167,3 +167,27 @@ func PatternMultiplier(hand []universal.Tile, melds []universal.Meld) int {
 	}
 	return mul
 }
+
+func SichuanFan(hand []universal.Tile, melds []universal.Meld) int {
+	fan := 1
+	if CanSevenPairs(hand) {
+		fan += 6
+	}
+	if IsQingYiSe(hand, melds) {
+		fan += 6
+	}
+	if SichuanPungHu(hand, melds) {
+		fan += 5
+	}
+	return fan
+}
+
+func SichuanPungHu(hand []universal.Tile, melds []universal.Meld) bool {
+	if len(melds) == 0 {
+		return false
+	}
+	if !universal.CanWinStandard(hand) {
+		return false
+	}
+	return true
+}

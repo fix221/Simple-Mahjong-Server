@@ -991,6 +991,7 @@ func doAction(p *Player, raw json.RawMessage) {
 			"continue": cont, "won_seats": wonSeatList(st), "win_kind": st.WinKind,
 		})
 		if st.Rule == "sichuan" {
+			settleSichuanWin(r, seat, st.WinKind, st.LastFrom, st.LastKongKind, st.LastKongFrom)
 			afterSichuanWin(r, st.LastFrom)
 		} else {
 			endGame(r)
@@ -1051,6 +1052,7 @@ func doSelfWin(p *Player) {
 		"win_kind": st.WinKind, "kong_kind": st.LastKongKind,
 	})
 	if st.Rule == "sichuan" {
+		settleSichuanWin(r, seat, st.WinKind, -1, st.LastKongKind, st.LastKongFrom)
 		afterSichuanWin(r, seat)
 	} else {
 		endGame(r)
@@ -1103,27 +1105,13 @@ func wonSeatList(st *State) []int {
 }
 
 func sichuanShouldEnd(st *State, n int) bool {
-	wonCount := 0
-	for _, w := range st.Won {
-		if w {
-			wonCount++
-		}
-	}
-	alive := n - wonCount
-	if alive <= 1 {
-		return true
-	}
-	// 4 人局经典：3 人胡完结束
-	if n >= 4 && wonCount >= 3 {
-		return true
-	}
-	return false
+	return len(st.Wall) == 0
 }
 
 func afterSichuanWin(r *Room, afterSeat int) {
 	st := r.State
 	n := len(r.Players)
-	// 血战：有人胡后继续，直到只剩 1 人未胡或 3 人已胡
+	// 血战：有人胡后继续，直到牌墙耗尽
 	st.Phase = "discard"
 	st.NeedAct = make([]bool, n)
 	st.Passed = make([]bool, n)
@@ -1502,6 +1490,47 @@ func endGame(r *Room) {
 	r.InGame = false
 	r.State = nil
 	broadcast(r, "room", roomView(r))
+}
+
+func settleSichuanWin(r *Room, ws int, kind string, from int, kongKind string, kongFrom int) map[string]any {
+	st := r.State
+	n := len(r.Players)
+	base := st.BaseScore
+	if base <= 0 {
+		base = 1
+	}
+	winDelta := make([]int, n)
+	fan := 1
+	if ws >= 0 && ws < n && st.Won[ws] {
+		fan = tuidaohu.SichuanFan(st.Hands[ws], st.Melds[ws])
+		pay := tuidaohu.ClampPay张(base * fan)
+		switch kind {
+		case "self":
+			for i := 0; i < n; i++ {
+				if i == ws {
+					continue
+				}
+				winDelta[i] -= pay
+				winDelta[ws] += pay
+			}
+		case "ron", "rob_jia":
+			if from >= 0 && from < n && from != ws {
+				winDelta[from] -= pay
+				winDelta[ws] += pay
+			}
+		}
+	}
+		detail := map[string]any{
+			"win_seat": ws,
+			"win_kind": kind,
+			"last_from": from,
+			"last_kong": kongKind,
+			"last_kong_from": kongFrom,
+			"base": base,
+			"fan": fan,
+			"pay": tuidaohu.ClampPay张(base * fan),
+		}
+	return map[string]any{"winDelta": winDelta, "detail": detail}
 }
 
 func doRegister(p *Player, raw json.RawMessage) {
