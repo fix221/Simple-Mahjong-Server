@@ -1,12 +1,18 @@
-package game
+package tuidaohu
 
+import "mahjong/internal/game/universal"
+
+// KongRecord: per-hand kong fee record (settle at end)
+// Kind: an | ming | jia
 type KongRecord struct {
 	Seat   int
-	Kind   string // an | ming | jia
+	Kind   string
 	From   int
 	TileID int
 }
 
+// ScoreKongFees returns net delta per seat.
+// ming: donor pays 3; an: each other pays 2; jia: others pay 1 total (next seat pays 1)
 func ScoreKongFees(n int, recs []KongRecord) []int {
 	delta := make([]int, n)
 	if n <= 1 {
@@ -31,7 +37,6 @@ func ScoreKongFees(n int, recs []KongRecord) []int {
 				delta[r.Seat] += 2
 			}
 		case "jia":
-			// others pay 1 total; integer: next seat pays 1
 			payer := (r.Seat + 1) % n
 			for k := 0; k < n && payer == r.Seat; k++ {
 				payer = (payer + 1) % n
@@ -43,6 +48,23 @@ func ScoreKongFees(n int, recs []KongRecord) []int {
 		}
 	}
 	return delta
+}
+
+func IsValidHorse(t universal.Tile) bool {
+	if t.Suit > universal.Tiao {
+		return false
+	}
+	return t.Num == 1 || t.Num == 5 || t.Num == 9
+}
+
+func CountValidHorses(tiles []universal.Tile) int {
+	n := 0
+	for _, t := range tiles {
+		if IsValidHorse(t) {
+			n++
+		}
+	}
+	return n
 }
 
 func TotalMultiplier(horseFan, patternMul int) int {

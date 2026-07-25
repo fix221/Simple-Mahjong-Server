@@ -1,4 +1,4 @@
-package game
+package universal
 
 import (
 	"encoding/json"
@@ -6,11 +6,10 @@ import (
 	"math"
 )
 
-// ParseTile ?? Godot/JS ??? float ??
+// ParseTile accepts Godot/JS float numbers in JSON
 func ParseTile(raw json.RawMessage) (Tile, error) {
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
-		// ?????????????
 		var t Tile
 		if err2 := json.Unmarshal(raw, &t); err2 == nil {
 			return t, nil

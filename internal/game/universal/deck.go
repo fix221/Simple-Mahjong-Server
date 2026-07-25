@@ -1,4 +1,4 @@
-﻿package game
+package universal
 
 import (
 	"math/rand"
