@@ -21,9 +21,11 @@ type Msg struct {
 }
 
 type Player struct {
-	ID   string          `json:"id"`
-	Name string          `json:"name"`
-	Conn *websocket.Conn `json:"-"`
+	ID     string          `json:"id"`
+	Name   string          `json:"name"`
+	Gold   int             `json:"gold"`
+	Online bool            `json:"online"`
+	Conn   *websocket.Conn `json:"-"`
 }
 
 type Room struct {
@@ -61,6 +63,38 @@ type Hub struct {
 
 var hub = &Hub{rooms: map[string]*Room{}}
 
+// 按昵称记金币：每个名称默认 10000（进程内，重启清零）
+const defaultGold = 10000
+var (
+	nameGoldMu sync.Mutex
+	nameGold   = map[string]int{}
+)
+
+func goldForName(name string) int {
+	nameGoldMu.Lock()
+	defer nameGoldMu.Unlock()
+	if name == "" {
+		return defaultGold
+	}
+	if g, ok := nameGold[name]; ok {
+		return g
+	}
+	nameGold[name] = defaultGold
+	return defaultGold
+}
+
+func setGoldForName(name string, g int) {
+	nameGoldMu.Lock()
+	defer nameGoldMu.Unlock()
+	if name == "" {
+		return
+	}
+	if g < 0 {
+		g = 0
+	}
+	nameGold[name] = g
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	http.HandleFunc("/ws", onWS)
@@ -76,19 +110,61 @@ func onWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	p := &Player{ID: id6(), Conn: c, Name: "玩家"}
-	reply(c, "connected", map[string]any{"id": p.ID})
-	defer onLeave(p)
+	// 长连接：读超时 + pong 续期；定时 ping
+	const pongWait = 90 * time.Second
+	const pingPeriod = 30 * time.Second
+	c.SetReadLimit(1 << 20)
+	_ = c.SetReadDeadline(time.Now().Add(pongWait))
+	c.SetPongHandler(func(string) error {
+		return c.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	// session 可在 resume 后切换为房间内原玩家指针
+	session := &Player{ID: id6(), Conn: c, Name: "玩家", Online: true, Gold: defaultGold}
+	reply(c, "connected", map[string]any{"id": session.ID, "resume_hint": true, "gold": session.Gold})
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := c.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	defer func() {
+		close(done)
+		onLeave(session)
+	}()
+
 	for {
 		_, b, err := c.ReadMessage()
 		if err != nil {
 			return
 		}
+		_ = c.SetReadDeadline(time.Now().Add(pongWait))
 		var m Msg
 		if json.Unmarshal(b, &m) != nil {
 			continue
 		}
-		handle(p, m)
+		if m.Type == "ping" {
+			reply(c, "pong", map[string]any{"t": time.Now().Unix()})
+			continue
+		}
+		if m.Type == "resume" {
+			if np := tryResume(session, c, m.Data); np != nil {
+				session = np
+			}
+			continue
+		}
+		handle(session, m)
 	}
 }
 
@@ -101,6 +177,12 @@ func handle(p *Player, m Msg) {
 		json.Unmarshal(m.Data, &d)
 		if d.Name != "" {
 			p.Name = d.Name
+			// 每个名称默认 10000 金币（已有则沿用进程内记录）
+			p.Gold = goldForName(p.Name)
+			reply(p.Conn, "profile", map[string]any{
+				"name": p.Name,
+				"gold": p.Gold,
+			})
 		}
 	case "create_room":
 		createRoom(p, m.Data)
@@ -125,6 +207,100 @@ func handle(p *Player, m Msg) {
 	}
 }
 
+
+// tryResume 用旧 player_id 恢复离线座位，成功返回房间内玩家指针
+func tryResume(temp *Player, c *websocket.Conn, raw json.RawMessage) *Player {
+	var d struct {
+		PlayerID string `json:"player_id"`
+		Name     string `json:"name"`
+	}
+	if json.Unmarshal(raw, &d) != nil || d.PlayerID == "" {
+		reply(c, "error", map[string]string{"msg": "重连参数无效"})
+		return nil
+	}
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+
+	for _, r := range hub.rooms {
+		for seat, pl := range r.Players {
+			if pl.ID != d.PlayerID {
+				continue
+			}
+			// 已在线且不是同一连接：拒绝顶号或允许顶号——允许顶号
+			if pl.Online && pl.Conn != nil && pl.Conn != c {
+				_ = pl.Conn.Close()
+			}
+			pl.Conn = c
+			pl.Online = true
+			if d.Name != "" {
+				pl.Name = d.Name
+			}
+			// 临时连接只是壳，不进房间
+			temp.Online = false
+			temp.Conn = nil
+
+			broadcast(r, "player_reconnected", map[string]any{
+				"player_id": pl.ID,
+				"name":      pl.Name,
+				"seat":      seat,
+			})
+			broadcast(r, "tips", map[string]any{
+				"msg": pl.Name + " 已重新连接",
+			})
+			broadcast(r, "room", roomView(r))
+
+			// 推送完整状态给重连者
+			pushResumeState(pl, r, seat)
+			return pl
+		}
+	}
+	reply(c, "resume_fail", map[string]any{"msg": "没有可恢复的对局，请重新进房"})
+	return nil
+}
+
+func pushResumeState(p *Player, r *Room, seat int) {
+	data := map[string]any{
+		"id":      p.ID,
+		"room":    roomView(r),
+		"in_game": r.InGame,
+		"seat":    seat,
+		"rule":    r.Rule,
+		"players": names(r),
+	}
+	if !r.InGame || r.State == nil {
+		reply(p.Conn, "resume_ok", data)
+		return
+	}
+	st := r.State
+	data["hand"] = st.Hands[seat]
+	data["phase"] = st.Phase
+	data["current"] = st.Current
+	data["wall"] = len(st.Wall)
+	data["won"] = st.Won
+	if st.Rule == "sichuan" {
+		data["que"] = st.Que[seat]
+		data["all_que"] = st.Que
+		data["need_exchange"] = st.Phase == "exchange" && !st.Exchanged[seat]
+		data["need_dingque"] = st.Phase == "dingque" && !st.QueDone[seat]
+		data["exchanged"] = st.Exchanged[seat]
+	}
+	// 弃牌简表
+	disc := make([][]game.Tile, len(st.Discards))
+	for i := range st.Discards {
+		disc[i] = st.Discards[i]
+	}
+	data["discards"] = disc
+	reply(p.Conn, "resume_ok", data)
+
+	// 若轮到他操作，补发提示
+	if st.Phase == "discard" && st.Current == seat && !st.Won[seat] {
+		reply(p.Conn, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": len(st.Wall)})
+	}
+	if st.Phase == "wait_action" && st.NeedAct != nil && seat < len(st.NeedAct) && st.NeedAct[seat] && !st.Passed[seat] {
+		// 简化：提示可操作，具体按钮由客户端根据状态再请求；补发 action 粗提示
+		reply(p.Conn, "tips", map[string]any{"msg": "有人出牌，请查看是否可碰/胡"})
+	}
+}
 func createRoom(p *Player, raw json.RawMessage) {
 	var d struct {
 		Rule string `json:"rule"`
@@ -167,26 +343,67 @@ func joinRoom(p *Player, raw json.RawMessage) {
 			return
 		}
 	}
-	removeFromRoomsLocked(p)
+	removeFromRoomsLocked(p, "leave")
 	r.Players = append(r.Players, p)
 	broadcast(r, "room", roomView(r))
 }
 
-func removeFromRoomsLocked(p *Player) {
+func removeFromRoomsLocked(p *Player, reason string) {
 	for id, r := range hub.rooms {
 		for i, x := range r.Players {
-			if x.ID == p.ID {
-				r.Players = append(r.Players[:i], r.Players[i+1:]...)
-				if len(r.Players) == 0 {
-					delete(hub.rooms, id)
-				} else {
-					if r.Owner == p.ID {
-						r.Owner = r.Players[0].ID
-					}
-					broadcast(r, "room", roomView(r))
+			if x.ID != p.ID {
+				continue
+			}
+			name := p.Name
+			seat := i
+			wasInGame := r.InGame && r.State != nil
+
+			// 对局中断线：保留座位，仅标记离线，避免牌局座位错乱
+			if wasInGame && reason == "disconnect" {
+				x.Online = false
+				x.Conn = nil
+				broadcast(r, "player_left", map[string]any{
+					"player_id": p.ID,
+					"name":      name,
+					"seat":      seat,
+					"reason":    "disconnect",
+					"in_game":   true,
+					"offline":   true,
+					"owner":     r.Owner,
+				})
+				broadcast(r, "tips", map[string]any{
+					"msg": name + " 断线了，等待重连",
+				})
+				// 若正好轮到他出牌，跳过以免整桌卡住
+				if r.State != nil && r.State.Phase == "discard" && r.State.Current == seat {
+					nextTurn(r, seat)
 				}
 				return
 			}
+
+			// 大厅离开 / 主动 leave：移除玩家
+			r.Players = append(r.Players[:i], r.Players[i+1:]...)
+			if len(r.Players) == 0 {
+				delete(hub.rooms, id)
+				return
+			}
+			if r.Owner == p.ID {
+				r.Owner = r.Players[0].ID
+			}
+			broadcast(r, "player_left", map[string]any{
+				"player_id": p.ID,
+				"name":      name,
+				"seat":      seat,
+				"reason":    reason,
+				"in_game":   wasInGame,
+				"offline":   false,
+				"owner":     r.Owner,
+			})
+			broadcast(r, "room", roomView(r))
+			if wasInGame {
+				broadcast(r, "tips", map[string]any{"msg": name + " 已离开房间"})
+			}
+			return
 		}
 	}
 }
@@ -194,16 +411,19 @@ func removeFromRoomsLocked(p *Player) {
 func leaveRoom(p *Player) {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
-	removeFromRoomsLocked(p)
+	removeFromRoomsLocked(p, "leave")
 }
 
 func onLeave(p *Player) {
-	leaveRoom(p)
+	hub.mu.Lock()
+	p.Online = false
+	removeFromRoomsLocked(p, "disconnect")
+	hub.mu.Unlock()
 	if p.Conn != nil {
-		p.Conn.Close()
+		_ = p.Conn.Close()
+		p.Conn = nil
 	}
 }
-
 func listRooms(p *Player) {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
@@ -529,19 +749,13 @@ func doAction(p *Player, raw json.RawMessage) {
 		}
 		st.Hands[seat] = cand
 		st.Won[seat] = true
-		broadcast(r, "won", map[string]any{"seat": seat, "from": st.LastFrom, "hand": st.Hands[seat], "continue": st.Rule == "sichuan"})
+		cont := st.Rule == "sichuan" && !sichuanShouldEnd(st, len(r.Players))
+		broadcast(r, "won", map[string]any{
+			"seat": seat, "from": st.LastFrom, "hand": st.Hands[seat],
+			"continue": cont, "won_seats": wonSeatList(st),
+		})
 		if st.Rule == "sichuan" {
-			alive := 0
-			for i := range st.Won {
-				if !st.Won[i] {
-					alive++
-				}
-			}
-			if alive <= 1 {
-				endGame(r)
-			} else {
-				nextTurn(r, st.LastFrom)
-			}
+			afterSichuanWin(r, st.LastFrom)
 		} else {
 			endGame(r)
 		}
@@ -582,19 +796,13 @@ func doSelfWin(p *Player) {
 		return
 	}
 	st.Won[seat] = true
-	broadcast(r, "won", map[string]any{"seat": seat, "from": -1, "hand": st.Hands[seat], "continue": st.Rule == "sichuan"})
+	cont := st.Rule == "sichuan" && !sichuanShouldEnd(st, len(r.Players))
+	broadcast(r, "won", map[string]any{
+		"seat": seat, "from": -1, "hand": st.Hands[seat],
+		"continue": cont, "won_seats": wonSeatList(st),
+	})
 	if st.Rule == "sichuan" {
-		alive := 0
-		for i := range st.Won {
-			if !st.Won[i] {
-				alive++
-			}
-		}
-		if alive <= 1 {
-			endGame(r)
-		} else {
-			nextTurn(r, seat)
-		}
+		afterSichuanWin(r, seat)
 	} else {
 		endGame(r)
 	}
@@ -606,6 +814,10 @@ func nextTurn(r *Room, after int) {
 	for k := 1; k <= n; k++ {
 		i := (after + k) % n
 		if st.Won[i] {
+			continue
+		}
+		// 离线座位跳过（等待其重连期间不卡死整桌）
+		if i < len(r.Players) && r.Players[i] != nil && !r.Players[i].Online {
 			continue
 		}
 		if len(st.Wall) == 0 {
@@ -635,6 +847,49 @@ func nextTurn(r *Room, after int) {
 	endGame(r)
 }
 
+
+// sichuanShouldEnd 血战：未胡人数 <=1，或已有3人胡（4人标准）
+func wonSeatList(st *State) []int {
+	out := make([]int, 0)
+	for i, w := range st.Won {
+		if w {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+func sichuanShouldEnd(st *State, n int) bool {
+	wonCount := 0
+	for _, w := range st.Won {
+		if w {
+			wonCount++
+		}
+	}
+	alive := n - wonCount
+	if alive <= 1 {
+		return true
+	}
+	// 4 人局经典：3 人胡完结束
+	if n >= 4 && wonCount >= 3 {
+		return true
+	}
+	return false
+}
+
+func afterSichuanWin(r *Room, afterSeat int) {
+	st := r.State
+	n := len(r.Players)
+	// 清理等待操作状态
+	st.Phase = "discard"
+	st.NeedAct = make([]bool, n)
+	st.Passed = make([]bool, n)
+	if sichuanShouldEnd(st, n) {
+		endGame(r)
+		return
+	}
+	nextTurn(r, afterSeat)
+}
 func drawOne(st *State, seat int) {
 	if len(st.Wall) == 0 {
 		return
@@ -689,9 +944,9 @@ func names(r *Room) []string {
 }
 
 func roomView(r *Room) map[string]any {
-	ps := make([]map[string]string, 0, len(r.Players))
+	ps := make([]map[string]any, 0, len(r.Players))
 	for _, p := range r.Players {
-		ps = append(ps, map[string]string{"id": p.ID, "name": p.Name})
+		ps = append(ps, map[string]any{"id": p.ID, "name": p.Name, "online": p.Online, "gold": p.Gold})
 	}
 	return map[string]any{"id": r.ID, "rule": r.Rule, "owner": r.Owner, "in_game": r.InGame, "players": ps}
 }
@@ -701,12 +956,14 @@ func reply(c *websocket.Conn, typ string, data any) {
 		return
 	}
 	b, _ := json.Marshal(data)
-	c.WriteJSON(Msg{Type: typ, Data: b})
+	_ = c.WriteJSON(Msg{Type: typ, Data: b})
 }
 
 func broadcast(r *Room, typ string, data any) {
 	for _, p := range r.Players {
-		reply(p.Conn, typ, data)
+		if p != nil && p.Online && p.Conn != nil {
+			reply(p.Conn, typ, data)
+		}
 	}
 }
 
