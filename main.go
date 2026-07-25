@@ -985,7 +985,7 @@ func doAction(p *Player, raw json.RawMessage) {
 		st.Hands[seat] = cand
 		st.Won[seat] = true
 		st.WinSeat = seat
-		cont := st.Rule == "sichuan" && !sichuanShouldEnd(st, len(r.Players))
+		cont := st.Rule == "sichuan"
 		broadcast(r, "won", map[string]any{
 			"seat": seat, "from": st.LastFrom, "hand": st.Hands[seat],
 			"continue": cont, "won_seats": wonSeatList(st), "win_kind": st.WinKind,
@@ -1044,7 +1044,7 @@ func doSelfWin(p *Player) {
 	} else {
 		st.WinKind = "self"
 	}
-	cont := st.Rule == "sichuan" && !sichuanShouldEnd(st, len(r.Players))
+	cont := st.Rule == "sichuan"
 	broadcast(r, "won", map[string]any{
 		"seat": seat, "from": -1, "hand": st.Hands[seat],
 		"continue": cont, "won_seats": wonSeatList(st),
