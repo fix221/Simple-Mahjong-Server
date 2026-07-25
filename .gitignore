@@ -1,0 +1,29 @@
+# binaries / build
+/mahjong-server
+/mahjong-server.exe
+*.exe
+*.test
+*.out
+coverage.out
+
+# sqlite data (local)
+*.db
+*.db-*
+*.db-journal
+*.db-wal
+*.db-shm
+mahjong.db
+
+# env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor noise in this folder only
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

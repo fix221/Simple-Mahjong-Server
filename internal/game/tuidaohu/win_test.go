@@ -51,8 +51,8 @@ func TestQingSeven(t *testing.T) {
 		T(universal.Wan, 5), T(universal.Wan, 5), T(universal.Wan, 6), T(universal.Wan, 6),
 		T(universal.Wan, 7), T(universal.Wan, 7),
 	}
-	if PatternMultiplier(hand, nil) != 4 {
-		t.Fatalf("want 4 got %d", PatternMultiplier(hand, nil))
+	if PatternMultiplier(hand, nil) != 12 {
+		t.Fatalf("want 12 got %d", PatternMultiplier(hand, nil))
 	}
 }
 

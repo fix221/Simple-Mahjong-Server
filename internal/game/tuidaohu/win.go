@@ -152,7 +152,7 @@ func IsQingYiSe(hand []universal.Tile, melds []universal.Meld) bool {
 	return set
 }
 
-// PatternMultiplier: seven pairs x2, thirteen x2, qing x2; multiply stack
+// PatternMultiplier: seven pairs x2, thirteen x2, qing x6; multiply stack
 func PatternMultiplier(hand []universal.Tile, melds []universal.Meld) int {
 	mul := 1
 	if len(melds) == 0 {
@@ -163,7 +163,7 @@ func PatternMultiplier(hand []universal.Tile, melds []universal.Meld) int {
 		}
 	}
 	if IsQingYiSe(hand, melds) {
-		mul *= 2
+		mul *= 6
 	}
 	return mul
 }
