@@ -1,9 +1,25 @@
-﻿package game
+package game
 
 import "sort"
 
-// CanWin 标准 4 面子 + 1 将
+// CanWin: standard / seven pairs / thirteen-bukao
 func CanWin(hand []Tile) bool {
+	if len(hand)%3 != 2 {
+		return false
+	}
+	if CanWinStandard(hand) {
+		return true
+	}
+	if CanSevenPairs(hand) {
+		return true
+	}
+	if CanThirteenOrphansLike(hand) {
+		return true
+	}
+	return false
+}
+
+func CanWinStandard(hand []Tile) bool {
 	if len(hand)%3 != 2 {
 		return false
 	}
@@ -20,6 +36,166 @@ func CanWin(hand []Tile) bool {
 		}
 	}
 	return false
+}
+
+func CanSevenPairs(hand []Tile) bool {
+	if len(hand) != 14 {
+		return false
+	}
+	c := count(hand)
+	pairs := 0
+	for _, n := range c {
+		if n == 0 {
+			continue
+		}
+		if n%2 != 0 {
+			return false
+		}
+		pairs += n / 2
+	}
+	return pairs == 7
+}
+
+// CanThirteenOrphansLike: 147/258/369 each suit once + 5 distinct honors, all singles
+func CanThirteenOrphansLike(hand []Tile) bool {
+	if len(hand) != 14 {
+		return false
+	}
+	c := count(hand)
+	for _, n := range c {
+		if n > 1 {
+			return false
+		}
+	}
+
+	honorN := 0
+	for id := range c {
+		suit := Suit(id / 10)
+		if suit == Feng || suit == Jian {
+			honorN++
+		}
+	}
+	if honorN > 5 {
+		return false
+	}
+
+	suitNums := map[Suit][]int{}
+	for id := range c {
+		suit := Suit(id / 10)
+		if suit > Tiao {
+			continue
+		}
+		num := id % 10
+		suitNums[suit] = append(suitNums[suit], num)
+	}
+	if len(suitNums[Wan]) == 0 || len(suitNums[Tong]) == 0 || len(suitNums[Tiao]) == 0 {
+		return false
+	}
+
+	type groupKey int
+	const (
+		g147 groupKey = 1
+		g258 groupKey = 2
+		g369 groupKey = 3
+	)
+	matchGroup := func(nums []int) (groupKey, bool) {
+		if len(nums) != 3 {
+			return 0, false
+		}
+		sort.Ints(nums)
+		a, b, c0 := nums[0], nums[1], nums[2]
+		if a == 1 && b == 4 && c0 == 7 {
+			return g147, true
+		}
+		if a == 2 && b == 5 && c0 == 8 {
+			return g258, true
+		}
+		if a == 3 && b == 6 && c0 == 9 {
+			return g369, true
+		}
+		return 0, false
+	}
+
+	used := map[groupKey]bool{}
+	for _, s := range []Suit{Wan, Tong, Tiao} {
+		nums := append([]int{}, suitNums[s]...)
+		g, ok := matchGroup(nums)
+		if !ok {
+			return false
+		}
+		if used[g] {
+			return false
+		}
+		used[g] = true
+	}
+	if !used[g147] || !used[g258] || !used[g369] {
+		return false
+	}
+	if honorN != 5 {
+		return false
+	}
+	return true
+}
+
+func IsQingYiSe(hand []Tile, melds []Meld) bool {
+	var suit Suit
+	set := false
+	check := func(t Tile) bool {
+		if t.Suit > Tiao {
+			return false
+		}
+		if !set {
+			suit = t.Suit
+			set = true
+			return true
+		}
+		return t.Suit == suit
+	}
+	for _, t := range hand {
+		if !check(t) {
+			return false
+		}
+	}
+	for _, m := range melds {
+		for _, t := range m.Tiles {
+			if !check(t) {
+				return false
+			}
+		}
+	}
+	return set
+}
+
+func PatternMultiplier(hand []Tile, melds []Meld) int {
+	mul := 1
+	if len(melds) == 0 {
+		if CanSevenPairs(hand) {
+			mul *= 2
+		} else if CanThirteenOrphansLike(hand) {
+			mul *= 2
+		}
+	}
+	if IsQingYiSe(hand, melds) {
+		mul *= 2
+	}
+	return mul
+}
+
+func IsValidHorse(t Tile) bool {
+	if t.Suit > Tiao {
+		return false
+	}
+	return t.Num == 1 || t.Num == 5 || t.Num == 9
+}
+
+func CountValidHorses(tiles []Tile) int {
+	n := 0
+	for _, t := range tiles {
+		if IsValidHorse(t) {
+			n++
+		}
+	}
+	return n
 }
 
 func count(hand []Tile) map[int]int {
@@ -49,7 +225,6 @@ func formMelds(c map[int]int) bool {
 	id := ids[0]
 	n := c[id]
 
-	// 刻子
 	if n >= 3 {
 		c[id] -= 3
 		if formMelds(c) {
@@ -59,7 +234,6 @@ func formMelds(c map[int]int) bool {
 		c[id] += 3
 	}
 
-	// 顺子（仅万筒条）
 	suit := Suit(id / 10)
 	num := id % 10
 	if suit <= Tiao && num <= 7 {
@@ -92,7 +266,6 @@ func CanPung(hand []Tile, t Tile) bool {
 	return n >= 2
 }
 
-// RemoveN 从手牌移除 n 张同 ID 的牌
 func RemoveN(hand []Tile, t Tile, n int) ([]Tile, bool) {
 	out := make([]Tile, 0, len(hand))
 	left := n

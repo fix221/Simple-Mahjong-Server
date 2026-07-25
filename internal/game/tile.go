@@ -1,4 +1,4 @@
-﻿package game
+package game
 
 // Suit: 0万 1筒 2条 3风 4箭
 type Suit int
@@ -22,7 +22,9 @@ type MeldType int
 
 const (
 	MeldPung MeldType = iota
-	MeldKong
+	MeldAnKong
+	MeldMingKong
+	MeldJiaKong
 )
 
 type Meld struct {

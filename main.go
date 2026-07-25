@@ -36,6 +36,7 @@ type Room struct {
 	InGame  bool      `json:"in_game"`
 	Players []*Player `json:"players"`
 	State   *State    `json:"-"`
+	Dealer  int       `json:"dealer"`
 }
 
 type State struct {
@@ -53,8 +54,20 @@ type State struct {
 	NeedAct   []bool
 	Exchange  [][]game.Tile
 	Exchanged []bool
-	Que       []int  // 定缺花色 0万1筒2条，-1未选
+	Que       []int
 	QueDone   []bool
+	PendingJiaKong bool
+
+	Dealer       int
+	SealedN      int
+	SealedSnap   []game.Tile
+	KongRecords  []game.KongRecord
+	LastKongKind string
+	LastKongFrom int
+	WinKind      string
+	WinSeat      int
+	IsHuang      bool
+	BaseScore    int
 }
 
 type Hub struct {
@@ -212,6 +225,10 @@ func handle(p *Player, m Msg) {
 		doSelfWin(p)
 	case "dingque":
 		doDingQue(p, m.Data)
+	case "kong":
+		doKong(p, m.Data)
+	case "rob_kong":
+		doRobKong(p, m.Data)
 	}
 }
 
@@ -336,19 +353,34 @@ func pushResumeState(p *Player, r *Room, seat int) {
 		return
 	}
 	st := r.State
+	// 手牌 + 副露必须一起推，否则碰/杠后会「少牌」
 	data["hand"] = st.Hands[seat]
+	data["hand_count"] = len(st.Hands[seat])
+	data["melds"] = st.Melds[seat]
+	allM := make([][]game.Meld, len(st.Melds))
+	for i := range st.Melds {
+		if i == seat {
+			allM[i] = st.Melds[i]
+		} else {
+			allM[i] = maskAnKongMelds(st.Melds[i])
+		}
+	}
+	data["all_melds"] = allM
 	data["phase"] = st.Phase
 	data["current"] = st.Current
-	data["wall"] = len(st.Wall)
+	data["wall"] = wallAvail(st)
 	data["won"] = st.Won
-	if st.Rule == "sichuan" {
+	if st.Rule == "sichuan" && st.Que != nil && seat < len(st.Que) {
 		data["que"] = st.Que[seat]
 		data["all_que"] = st.Que
-		data["need_exchange"] = st.Phase == "exchange" && !st.Exchanged[seat]
-		data["need_dingque"] = st.Phase == "dingque" && !st.QueDone[seat]
-		data["exchanged"] = st.Exchanged[seat]
+		if st.Exchanged != nil && seat < len(st.Exchanged) {
+			data["need_exchange"] = st.Phase == "exchange" && !st.Exchanged[seat]
+			data["exchanged"] = st.Exchanged[seat]
+		}
+		if st.QueDone != nil && seat < len(st.QueDone) {
+			data["need_dingque"] = st.Phase == "dingque" && !st.QueDone[seat]
+		}
 	}
-	// 弃牌简表
 	disc := make([][]game.Tile, len(st.Discards))
 	for i := range st.Discards {
 		disc[i] = st.Discards[i]
@@ -356,13 +388,36 @@ func pushResumeState(p *Player, r *Room, seat int) {
 	data["discards"] = disc
 	reply(p.Conn, "resume_ok", data)
 
-	// 若轮到他操作，补发提示
 	if st.Phase == "discard" && st.Current == seat && !st.Won[seat] {
-		reply(p.Conn, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": len(st.Wall)})
+		// 补发暗杠/加杠/自摸提示
+		sendSelfOptions(r, seat)
+		reply(p.Conn, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": wallAvail(st)})
 	}
-	if st.Phase == "wait_action" && st.NeedAct != nil && seat < len(st.NeedAct) && st.NeedAct[seat] && !st.Passed[seat] {
-		// 简化：提示可操作，具体按钮由客户端根据状态再请求；补发 action 粗提示
-		reply(p.Conn, "tips", map[string]any{"msg": "有人出牌，请查看是否可碰/胡"})
+	if st.Phase == "wait_action" && st.NeedAct != nil && seat < len(st.NeedAct) && st.NeedAct[seat] && (st.Passed == nil || !st.Passed[seat]) {
+		// 重发操作提示
+		tile := st.LastTile
+		canP := game.CanPung(st.Hands[seat], tile)
+		canK := game.CanMingKong(st.Hands[seat], tile)
+		canW := false
+		cand := append(append([]game.Tile{}, st.Hands[seat]...), tile)
+		if st.Rule == "sichuan" {
+			if st.Que[seat] >= 0 {
+				canW = game.CanWinSichuan(cand, st.Melds[seat], game.Suit(st.Que[seat]))
+			}
+			if st.Que[seat] >= 0 && int(tile.Suit) == st.Que[seat] {
+				canP = false
+				canK = false
+			}
+		} else {
+			// 推倒胡不可点炮
+			canW = false
+		}
+		if canP || canK || canW {
+			reply(p.Conn, "action_prompt", map[string]any{
+				"tile": tile, "from": st.LastFrom,
+				"can_pung": canP, "can_kong": canK, "can_win": canW, "self": false,
+			})
+		}
 	}
 }
 func createRoom(p *Player, raw json.RawMessage) {
@@ -559,6 +614,22 @@ func startGame(p *Player) {
 		game.SortHand(st.Hands[i])
 	}
 	st.Wall = deck
+	if r.Dealer < 0 || r.Dealer >= n {
+		r.Dealer = 0
+	}
+	st.Dealer = r.Dealer
+	st.BaseScore = 1
+	st.WinSeat = -1
+	st.LastKongFrom = -1
+	if r.Rule != "sichuan" {
+		st.SealedN = 6
+		if len(st.Wall) >= 6 {
+			st.SealedSnap = append([]game.Tile{}, st.Wall[len(st.Wall)-6:]...)
+		} else {
+			st.SealedSnap = append([]game.Tile{}, st.Wall...)
+			st.SealedN = len(st.Wall)
+		}
+	}
 	r.State = st
 	r.InGame = true
 	if r.Rule == "sichuan" {
@@ -570,15 +641,17 @@ func startGame(p *Player) {
 		}
 		return
 	}
-	st.Current = 0
+	st.Current = st.Dealer
 	st.Phase = "discard"
-	drawOne(st, 0)
+	_ = drawOne(st, st.Dealer)
 	for i, pl := range r.Players {
 		reply(pl.Conn, "game_start", map[string]any{
 			"seat": i, "rule": r.Rule, "hand": st.Hands[i], "exchange": false, "players": names(r),
+			"dealer": st.Dealer, "sealed": st.SealedN,
 		})
 	}
-	broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": len(st.Wall)})
+	broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": wallAvail(st)})
+	sendSelfOptions(r, st.Dealer)
 }
 
 func doExchange(p *Player, raw json.RawMessage) {
@@ -687,7 +760,7 @@ func doDingQue(p *Player, raw json.RawMessage) {
 	// 全部定缺完毕，庄家摸牌开始
 	st.Phase = "discard"
 	st.Current = 0
-	drawOne(st, 0)
+	_ = drawOne(st, 0)
 	ques := make([]int, len(r.Players))
 	copy(ques, st.Que)
 	for i, pl := range r.Players {
@@ -696,7 +769,7 @@ func doDingQue(p *Player, raw json.RawMessage) {
 			"draw": st.Hands[i][len(st.Hands[i])-1],
 		})
 	}
-	broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": len(st.Wall)})
+	broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": wallAvail(st)})
 }
 
 func doDiscard(p *Player, raw json.RawMessage) {
@@ -747,11 +820,13 @@ func doDiscard(p *Player, raw json.RawMessage) {
 	st.Discards[seat] = append(st.Discards[seat], tile)
 	st.LastFrom = seat
 	st.LastTile = tile
+	st.LastKongKind = ""
+	st.LastKongFrom = -1
 	st.Phase = "wait_action"
 	st.Passed = make([]bool, len(r.Players))
 	st.NeedAct = make([]bool, len(r.Players))
 	broadcast(r, "discarded", map[string]any{"seat": seat, "tile": tile})
-	reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat]})
+	reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat], "melds": st.Melds[seat]})
 	need := false
 	for i := 0; i < len(r.Players); i++ {
 		if i == seat || st.Won[i] {
@@ -764,15 +839,18 @@ func doDiscard(p *Player, raw json.RawMessage) {
 		if st.Rule == "sichuan" && st.Que[i] >= 0 {
 			canW = game.CanWinSichuan(cand, st.Melds[i], game.Suit(st.Que[i]))
 		}
-		// 四川：不能碰定缺花色
+		canK := game.CanMingKong(st.Hands[i], tile)
+		// 四川：不能碰/杠定缺花色
 		if st.Rule == "sichuan" && st.Que[i] >= 0 && int(tile.Suit) == st.Que[i] {
 			canP = false
+			canK = false
 		}
-		if canP || canW {
+		if canP || canK || canW {
 			need = true
 			st.NeedAct[i] = true
 			reply(r.Players[i].Conn, "action_prompt", map[string]any{
-				"tile": tile, "from": seat, "can_pung": canP, "can_win": canW, "self": false,
+				"tile": tile, "from": seat,
+				"can_pung": canP, "can_kong": canK, "can_win": canW, "self": false,
 			})
 		}
 	}
@@ -814,30 +892,90 @@ func doAction(p *Player, raw json.RawMessage) {
 		if len(st.Discards[st.LastFrom]) > 0 {
 			st.Discards[st.LastFrom] = st.Discards[st.LastFrom][:len(st.Discards[st.LastFrom])-1]
 		}
-		broadcast(r, "pung", map[string]any{"seat": seat, "tile": t, "from": st.LastFrom})
-		reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat]})
-		broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": len(st.Wall)})
-	case "win":
-		// 推倒胡禁止点炮，只能 self_win
-		if st.Rule != "sichuan" {
-			reply(p.Conn, "error", map[string]string{"msg": "推倒胡只能自摸"})
+		broadcast(r, "pung", map[string]any{"seat": seat, "tile": t, "from": st.LastFrom, "melds": st.Melds[seat]})
+		reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat], "melds": st.Melds[seat]})
+		sendSelfOptions(r, seat)
+		broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": wallAvail(st)})
+	case "kong":
+		// 别人弃牌后的直杠（点杠），不可抢杠
+		if !game.CanMingKong(st.Hands[seat], st.LastTile) {
 			return
 		}
-		if st.Que[seat] < 0 {
-			reply(p.Conn, "error", map[string]string{"msg": "请先定缺"})
+		t := st.LastTile
+		if st.Rule == "sichuan" && st.Que[seat] >= 0 && int(t.Suit) == st.Que[seat] {
+			return
+		}
+		hand, ok := game.RemoveN(st.Hands[seat], t, 3)
+		if !ok {
+			return
+		}
+		st.Hands[seat] = hand
+		st.Melds[seat] = append(st.Melds[seat], game.Meld{
+			Type: game.MeldMingKong, Tiles: []game.Tile{t, t, t, t},
+		})
+		fromSeat := st.LastFrom
+		st.KongRecords = append(st.KongRecords, game.KongRecord{Seat: seat, Kind: "ming", From: fromSeat, TileID: t.ID()})
+		st.LastKongKind = "ming"
+		st.LastKongFrom = fromSeat
+		if len(st.Discards[fromSeat]) > 0 {
+			st.Discards[fromSeat] = st.Discards[fromSeat][:len(st.Discards[fromSeat])-1]
+		}
+		broadcast(r, "kong", map[string]any{
+			"seat": seat, "tile": t, "from": fromSeat, "kind": "ming",
+			"melds": st.Melds[seat],
+		})
+		afterKongDraw(r, seat)
+	case "win":
+		// tuidaohu: only rob jia-kong; no normal ron. sichuan: ron ok
+		if st.Rule != "sichuan" && !st.PendingJiaKong {
+			reply(p.Conn, "error", map[string]string{"msg": "tuidaohu: self-draw or rob-kong only"})
 			return
 		}
 		cand := append(append([]game.Tile{}, st.Hands[seat]...), st.LastTile)
-		if !game.CanWinSichuan(cand, st.Melds[seat], game.Suit(st.Que[seat])) {
-			reply(p.Conn, "error", map[string]string{"msg": "未定缺干净或牌型不能胡"})
-			return
+		if st.Rule == "sichuan" {
+			if st.Que[seat] < 0 {
+				reply(p.Conn, "error", map[string]string{"msg": "dingque first"})
+				return
+			}
+			if !game.CanWinSichuan(cand, st.Melds[seat], game.Suit(st.Que[seat])) {
+				reply(p.Conn, "error", map[string]string{"msg": "cannot win"})
+				return
+			}
+		} else {
+			if !game.CanWin(cand) {
+				reply(p.Conn, "error", map[string]string{"msg": "cannot win"})
+				return
+			}
+		}
+		if st.PendingJiaKong {
+			fs := st.LastFrom
+			if fs >= 0 && fs < len(st.Melds) {
+				for mi, m := range st.Melds[fs] {
+					if (m.Type == game.MeldJiaKong) && len(m.Tiles) > 0 && m.Tiles[0].ID() == st.LastTile.ID() {
+						st.Melds[fs][mi] = game.Meld{Type: game.MeldPung, Tiles: []game.Tile{st.LastTile, st.LastTile, st.LastTile}}
+						break
+					}
+				}
+			}
+			// jia kong cancelled: drop fee record for this jia if last record matches
+			if n := len(st.KongRecords); n > 0 {
+				last := st.KongRecords[n-1]
+				if last.Kind == "jia" && last.Seat == fs && last.TileID == st.LastTile.ID() {
+					st.KongRecords = st.KongRecords[:n-1]
+				}
+			}
+			st.PendingJiaKong = false
+			st.WinKind = "rob_jia"
+		} else {
+			st.WinKind = "ron"
 		}
 		st.Hands[seat] = cand
 		st.Won[seat] = true
+		st.WinSeat = seat
 		cont := st.Rule == "sichuan" && !sichuanShouldEnd(st, len(r.Players))
 		broadcast(r, "won", map[string]any{
 			"seat": seat, "from": st.LastFrom, "hand": st.Hands[seat],
-			"continue": cont, "won_seats": wonSeatList(st),
+			"continue": cont, "won_seats": wonSeatList(st), "win_kind": st.WinKind,
 		})
 		if st.Rule == "sichuan" {
 			afterSichuanWin(r, st.LastFrom)
@@ -851,6 +989,11 @@ func doAction(p *Player, raw json.RawMessage) {
 			if st.NeedAct[i] && !st.Passed[i] {
 				return
 			}
+		}
+		if st.PendingJiaKong {
+			st.PendingJiaKong = false
+			afterKongDraw(r, st.LastFrom)
+			return
 		}
 		nextTurn(r, st.LastFrom)
 	}
@@ -881,10 +1024,18 @@ func doSelfWin(p *Player) {
 		return
 	}
 	st.Won[seat] = true
+	st.WinSeat = seat
+	// self-draw: if after ming-kong draw => ming_flower (full package); else self
+	if st.Rule != "sichuan" && st.LastKongKind == "ming" {
+		st.WinKind = "ming_flower"
+	} else {
+		st.WinKind = "self"
+	}
 	cont := st.Rule == "sichuan" && !sichuanShouldEnd(st, len(r.Players))
 	broadcast(r, "won", map[string]any{
 		"seat": seat, "from": -1, "hand": st.Hands[seat],
 		"continue": cont, "won_seats": wonSeatList(st),
+		"win_kind": st.WinKind, "kong_kind": st.LastKongKind,
 	})
 	if st.Rule == "sichuan" {
 		afterSichuanWin(r, seat)
@@ -905,28 +1056,23 @@ func nextTurn(r *Room, after int) {
 		if i < len(r.Players) && r.Players[i] != nil && !r.Players[i].Online {
 			continue
 		}
-		if len(st.Wall) == 0 {
+		if wallAvail(st) == 0 {
+			st.IsHuang = true
 			endGame(r)
 			return
 		}
-		drawOne(st, i)
+		if !drawOne(st, i) {
+			st.IsHuang = true
+			endGame(r)
+			return
+		}
 		st.Current = i
 		st.Phase = "discard"
-		canSelf := false
-		if st.Rule == "sichuan" {
-			if st.Que[i] >= 0 {
-				canSelf = game.CanWinSichuan(st.Hands[i], st.Melds[i], game.Suit(st.Que[i]))
-			}
-		} else {
-			canSelf = game.CanWin(st.Hands[i])
-		}
-		if canSelf {
-			reply(r.Players[i].Conn, "action_prompt", map[string]any{
-				"tile": st.Hands[i][len(st.Hands[i])-1], "from": -1, "can_pung": false, "can_win": true, "self": true,
-			})
-		}
-		reply(r.Players[i].Conn, "draw", map[string]any{"tile": st.Hands[i][len(st.Hands[i])-1], "hand": st.Hands[i]})
-		broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": len(st.Wall)})
+		reply(r.Players[i].Conn, "draw", map[string]any{
+			"tile": st.Hands[i][len(st.Hands[i])-1], "hand": st.Hands[i], "melds": st.Melds[i],
+		})
+		broadcast(r, "turn", map[string]any{"current": st.Current, "phase": st.Phase, "wall": wallAvail(st)})
+		sendSelfOptions(r, i)
 		return
 	}
 	endGame(r)
@@ -975,26 +1121,370 @@ func afterSichuanWin(r *Room, afterSeat int) {
 	}
 	nextTurn(r, afterSeat)
 }
-func drawOne(st *State, seat int) {
-	if len(st.Wall) == 0 {
+
+// sendSelfOptions 轮到自己时：自摸胡 / 暗杠 / 加杠
+// sendSelfOptions 轮到自己时：自摸胡 / 暗杠 / 加杠
+func sendSelfOptions(r *Room, seat int) {
+	st := r.State
+	if st == nil || seat < 0 || seat >= len(r.Players) {
 		return
+	}
+	pl := r.Players[seat]
+	if pl == nil || pl.Conn == nil || !pl.Online || st.Won[seat] {
+		return
+	}
+	canWin := false
+	if st.Rule == "sichuan" {
+		if st.Que[seat] >= 0 {
+			canWin = game.CanWinSichuan(st.Hands[seat], st.Melds[seat], game.Suit(st.Que[seat]))
+		}
+	} else {
+		canWin = game.CanWin(st.Hands[seat])
+	}
+	an := game.CanAnKong(st.Hands[seat])
+	jia := game.CanJiaKong(st.Hands[seat], st.Melds[seat])
+	if st.Rule == "sichuan" && st.Que[seat] >= 0 {
+		var an2, jia2 []game.Tile
+		for _, t := range an {
+			if int(t.Suit) != st.Que[seat] {
+				an2 = append(an2, t)
+			}
+		}
+		for _, t := range jia {
+			if int(t.Suit) != st.Que[seat] {
+				jia2 = append(jia2, t)
+			}
+		}
+		an, jia = an2, jia2
+	}
+	if !canWin && len(an) == 0 && len(jia) == 0 {
+		return
+	}
+	reply(pl.Conn, "self_options", map[string]any{
+		"can_win":  canWin,
+		"an_kong":  an,
+		"jia_kong": jia,
+		"hand":     st.Hands[seat],
+		"melds":    st.Melds[seat],
+	})
+	if canWin {
+		reply(pl.Conn, "action_prompt", map[string]any{
+			"tile": st.Hands[seat][len(st.Hands[seat])-1], "from": -1,
+			"can_pung": false, "can_kong": false, "can_win": true, "self": true,
+		})
+	}
+}
+
+func afterKongDraw(r *Room, seat int) {
+	st := r.State
+	// kong supplement: always last tile of entire wall (may use sealed)
+	if len(st.Wall) == 0 {
+		st.IsHuang = true
+		endGame(r)
+		return
+	}
+	t := st.Wall[len(st.Wall)-1]
+	st.Wall = st.Wall[:len(st.Wall)-1]
+	if st.SealedN > 0 {
+		st.SealedN--
+	}
+	st.Hands[seat] = append(st.Hands[seat], t)
+	st.Current = seat
+	st.Phase = "discard"
+	st.PendingJiaKong = false
+	st.NeedAct = make([]bool, len(r.Players))
+	st.Passed = make([]bool, len(r.Players))
+	// LastKongKind should already be set by caller; keep if set
+	reply(r.Players[seat].Conn, "draw", map[string]any{
+		"tile": t, "hand": st.Hands[seat], "melds": st.Melds[seat], "kong_draw": true,
+		"kong_kind": st.LastKongKind,
+	})
+	broadcast(r, "turn", map[string]any{"current": seat, "phase": "discard", "wall": wallAvail(st)})
+	sendSelfOptions(r, seat)
+}
+
+// doKong 自己回合暗杠/加杠: {kind:"an"|"jia", tile:{suit,num}}
+// 明杠走 doAction action=kong
+func doKong(p *Player, raw json.RawMessage) {
+	var d struct {
+		Kind string          `json:"kind"`
+		Tile json.RawMessage `json:"tile"`
+	}
+	if json.Unmarshal(raw, &d) != nil {
+		return
+	}
+	tile, err := game.ParseTile(d.Tile)
+	if err != nil {
+		reply(p.Conn, "error", map[string]string{"msg": "无效的牌"})
+		return
+	}
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+	r := findRoom(p)
+	if r == nil || r.State == nil {
+		return
+	}
+	st := r.State
+	seat := seatOf(r, p)
+	if seat < 0 || st.Won[seat] {
+		return
+	}
+	if seat != st.Current || st.Phase != "discard" {
+		reply(p.Conn, "error", map[string]string{"msg": "还没轮到你杠"})
+		return
+	}
+	if st.Rule == "sichuan" && st.Que[seat] >= 0 && int(tile.Suit) == st.Que[seat] {
+		reply(p.Conn, "error", map[string]string{"msg": "定缺花色不能杠"})
+		return
+	}
+	switch d.Kind {
+	case "an":
+		if game.CountID(st.Hands[seat], tile.ID()) < 4 {
+			reply(p.Conn, "error", map[string]string{"msg": "cannot an-kong"})
+			return
+		}
+		hand, ok := game.RemoveN(st.Hands[seat], tile, 4)
+		if !ok {
+			return
+		}
+		st.Hands[seat] = hand
+		st.Melds[seat] = append(st.Melds[seat], game.Meld{
+			Type: game.MeldAnKong, Tiles: []game.Tile{tile, tile, tile, tile},
+		})
+		st.KongRecords = append(st.KongRecords, game.KongRecord{Seat: seat, Kind: "an", From: -1, TileID: tile.ID()})
+		st.LastKongKind = "an"
+		st.LastKongFrom = -1
+		// public: show 2 tiles only; private full melds
+		pubMelds := maskAnKongMelds(st.Melds[seat])
+		broadcast(r, "kong", map[string]any{
+			"seat": seat, "tile": tile, "from": -1, "kind": "an",
+			"melds": pubMelds, "show_tiles": 2, "hidden_tiles": 2,
+		})
+		reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat], "melds": st.Melds[seat]})
+		afterKongDraw(r, seat)
+	case "jia":
+		idx := game.FindPungMeldIndex(st.Melds[seat], tile)
+		if idx < 0 || game.CountID(st.Hands[seat], tile.ID()) < 1 {
+			reply(p.Conn, "error", map[string]string{"msg": "cannot jia-kong"})
+			return
+		}
+		hand, ok := game.RemoveOne(st.Hands[seat], tile)
+		if !ok {
+			return
+		}
+		st.Hands[seat] = hand
+		st.Melds[seat][idx] = game.Meld{
+			Type: game.MeldJiaKong, Tiles: []game.Tile{tile, tile, tile, tile},
+		}
+		st.KongRecords = append(st.KongRecords, game.KongRecord{Seat: seat, Kind: "jia", From: -1, TileID: tile.ID()})
+		st.LastKongKind = "jia"
+		st.LastKongFrom = -1
+		st.LastFrom = seat
+		st.LastTile = tile
+		st.Phase = "wait_action"
+		st.PendingJiaKong = true
+		st.Passed = make([]bool, len(r.Players))
+		st.NeedAct = make([]bool, len(r.Players))
+		broadcast(r, "kong", map[string]any{
+			"seat": seat, "tile": tile, "from": seat, "kind": "jia",
+			"melds": st.Melds[seat], "robbable": true,
+		})
+		reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat], "melds": st.Melds[seat]})
+		need := false
+		for i := 0; i < len(r.Players); i++ {
+			if i == seat || st.Won[i] {
+				continue
+			}
+			cand := append(append([]game.Tile{}, st.Hands[i]...), tile)
+			canW := false
+			if st.Rule == "sichuan" && st.Que[i] >= 0 {
+				canW = game.CanWinSichuan(cand, st.Melds[i], game.Suit(st.Que[i]))
+			} else {
+				canW = game.CanWin(cand)
+			}
+			if canW {
+				need = true
+				st.NeedAct[i] = true
+				reply(r.Players[i].Conn, "action_prompt", map[string]any{
+					"tile": tile, "from": seat,
+					"can_pung": false, "can_kong": false, "can_win": true,
+					"self": false, "rob_kong": true,
+				})
+			}
+		}
+		if !need {
+			afterKongDraw(r, seat)
+		}
+	default:
+		reply(p.Conn, "error", map[string]string{"msg": "未知杠类型"})
+	}
+}
+
+// wallAvail: tiles before sealed zone for normal draws
+func wallAvail(st *State) int {
+	if st == nil {
+		return 0
+	}
+	n := len(st.Wall) - st.SealedN
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// drawOne normal draw from front; never takes sealed
+func drawOne(st *State, seat int) bool {
+	if wallAvail(st) == 0 {
+		return false
 	}
 	st.Hands[seat] = append(st.Hands[seat], st.Wall[0])
 	st.Wall = st.Wall[1:]
+	return true
+}
+
+// maskAnKongMelds: for public view, an-kong shows only 2 tiles
+func maskAnKongMelds(melds []game.Meld) []game.Meld {
+	out := make([]game.Meld, len(melds))
+	for i, m := range melds {
+		if m.Type == game.MeldAnKong && len(m.Tiles) >= 2 {
+			out[i] = game.Meld{Type: m.Type, Tiles: []game.Tile{m.Tiles[0], m.Tiles[1]}}
+		} else {
+			out[i] = m
+		}
+	}
+	return out
+}
+
+func doRobKong(p *Player, raw json.RawMessage) {
+	// alias: treat as action win during pending jia kong
+	var d struct {
+		Action string `json:"action"`
+	}
+	_ = json.Unmarshal(raw, &d)
+	if d.Action == "" || d.Action == "win" {
+		doAction(p, json.RawMessage(`{"action":"win"}`))
+		return
+	}
+	if d.Action == "pass" {
+		doAction(p, json.RawMessage(`{"action":"pass"}`))
+	}
 }
 
 func endGame(r *Room) {
 	st := r.State
+	n := len(r.Players)
+	base := st.BaseScore
+	if base <= 0 {
+		base = 1
+	}
+
+	// kong fees always settle (including huang)
+	kongDelta := game.ScoreKongFees(n, st.KongRecords)
+	winDelta := make([]int, n)
+	horseTiles := []game.Tile{}
+	horseFan := 0
+	patternMul := 1
+	totalMul := 0
+	detail := map[string]any{}
+
+	if !st.IsHuang && st.WinSeat >= 0 && st.WinSeat < n && st.Won[st.WinSeat] {
+		ws := st.WinSeat
+		// horses
+		if st.Rule != "sichuan" {
+			if st.LastKongKind == "an" && (st.WinKind == "self" || st.WinKind == "") {
+				// an-kong flower: sealed snapshot
+				horseTiles = append([]game.Tile{}, st.SealedSnap...)
+			} else {
+				// front 6 of remaining wall (or less)
+				take := 6
+				if len(st.Wall) < take {
+					take = len(st.Wall)
+				}
+				if take > 0 {
+					horseTiles = append([]game.Tile{}, st.Wall[:take]...)
+				}
+			}
+			horseFan = game.CountValidHorses(horseTiles)
+			patternMul = game.PatternMultiplier(st.Hands[ws], st.Melds[ws])
+			totalMul = game.TotalMultiplier(horseFan, patternMul)
+			pay := base * totalMul
+			switch st.WinKind {
+			case "ming_flower", "rob_jia":
+				// full package x3 by responsible seat
+				payer := -1
+				if st.WinKind == "ming_flower" {
+					payer = st.LastKongFrom
+				} else {
+					payer = st.LastFrom
+				}
+				if payer >= 0 && payer < n && payer != ws {
+					winDelta[payer] -= pay * 3
+					winDelta[ws] += pay * 3
+				} else {
+					// fallback share
+					for i := 0; i < n; i++ {
+						if i == ws {
+							continue
+						}
+						winDelta[i] -= pay
+						winDelta[ws] += pay
+					}
+				}
+			default:
+				// normal self-draw: each of others pays base*mul
+				for i := 0; i < n; i++ {
+					if i == ws {
+						continue
+					}
+					winDelta[i] -= pay
+					winDelta[ws] += pay
+				}
+			}
+		}
+		detail = map[string]any{
+			"win_seat":     ws,
+			"win_kind":     st.WinKind,
+			"horse_tiles":  horseTiles,
+			"horse_fan":    horseFan,
+			"pattern_mul":  patternMul,
+			"total_mul":    totalMul,
+			"base":         base,
+			"last_kong":    st.LastKongKind,
+		}
+	}
+
 	type row struct {
-		Name string      `json:"name"`
-		Won  bool        `json:"won"`
-		Hand []game.Tile `json:"hand"`
+		Name      string      `json:"name"`
+		Seat      int         `json:"seat"`
+		Won       bool        `json:"won"`
+		Hand      []game.Tile `json:"hand"`
+		KongDelta int         `json:"kong_delta"`
+		WinDelta  int         `json:"win_delta"`
+		Delta     int         `json:"delta"`
+		Gold      int         `json:"gold"`
 	}
 	var res []row
 	for i, pl := range r.Players {
-		res = append(res, row{Name: pl.Name, Won: st.Won[i], Hand: st.Hands[i]})
+		d := kongDelta[i] + winDelta[i]
+		pl.Gold += d
+		setGoldForName(pl.Name, pl.Gold)
+		res = append(res, row{
+			Name: pl.Name, Seat: i, Won: st.Won[i], Hand: st.Hands[i],
+			KongDelta: kongDelta[i], WinDelta: winDelta[i], Delta: d, Gold: pl.Gold,
+		})
 	}
-	broadcast(r, "game_over", map[string]any{"result": res})
+	broadcast(r, "game_over", map[string]any{
+		"result": res,
+		"huang":  st.IsHuang,
+		"dealer": st.Dealer,
+		"detail": detail,
+		"kongs":  st.KongRecords,
+	})
+	if st.IsHuang {
+		r.Dealer = st.Dealer
+	} else if st.WinSeat >= 0 {
+		r.Dealer = (st.Dealer + 1) % n
+	}
 	r.InGame = false
 	r.State = nil
 	broadcast(r, "room", roomView(r))
