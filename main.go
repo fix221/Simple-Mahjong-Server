@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,11 +58,12 @@ type State struct {
 }
 
 type Hub struct {
-	mu    sync.Mutex
-	rooms map[string]*Room
+	mu       sync.Mutex
+	rooms    map[string]*Room
+	sessions map[string]*Player
 }
 
-var hub = &Hub{rooms: map[string]*Room{}}
+var hub = &Hub{rooms: map[string]*Room{}, sessions: map[string]*Player{}}
 
 // 按昵称记金币：每个名称默认 10000（进程内，重启清零）
 const defaultGold = 10000
@@ -121,6 +123,9 @@ func onWS(w http.ResponseWriter, r *http.Request) {
 
 	// session 可在 resume 后切换为房间内原玩家指针
 	session := &Player{ID: id6(), Conn: c, Name: "玩家", Online: true, Gold: defaultGold}
+	hub.mu.Lock()
+	hub.sessions[session.ID] = session
+	hub.mu.Unlock()
 	reply(c, "connected", map[string]any{"id": session.ID, "resume_hint": true, "gold": session.Gold})
 
 	done := make(chan struct{})
@@ -141,7 +146,7 @@ func onWS(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		close(done)
-		onLeave(session)
+		onLeave(session, c)
 	}()
 
 	for {
@@ -179,6 +184,9 @@ func handle(p *Player, m Msg) {
 			p.Name = d.Name
 			// 每个名称默认 10000 金币（已有则沿用进程内记录）
 			p.Gold = goldForName(p.Name)
+			hub.mu.Lock()
+			hub.sessions[p.ID] = p
+			hub.mu.Unlock()
 			reply(p.Conn, "profile", map[string]any{
 				"name": p.Name,
 				"gold": p.Gold,
@@ -214,48 +222,104 @@ func tryResume(temp *Player, c *websocket.Conn, raw json.RawMessage) *Player {
 		PlayerID string `json:"player_id"`
 		Name     string `json:"name"`
 	}
-	if json.Unmarshal(raw, &d) != nil || d.PlayerID == "" {
-		reply(c, "error", map[string]string{"msg": "重连参数无效"})
+	if json.Unmarshal(raw, &d) != nil || strings.TrimSpace(d.PlayerID) == "" {
+		reply(c, "resume_fail", map[string]any{"msg": "重连参数无效"})
 		return nil
 	}
+	pid := strings.TrimSpace(d.PlayerID)
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 
-	for _, r := range hub.rooms {
-		for seat, pl := range r.Players {
-			if pl.ID != d.PlayerID {
-				continue
+	// 1) 全局会话表
+	pl := hub.sessions[pid]
+	// 2) 房间内再找一遍（防止 sessions 丢失）
+	var room *Room
+	seat := -1
+	if pl == nil {
+		for _, r := range hub.rooms {
+			for i, x := range r.Players {
+				if x != nil && x.ID == pid {
+					pl = x
+					room = r
+					seat = i
+					hub.sessions[pid] = x
+					break
+				}
 			}
-			// 已在线且不是同一连接：拒绝顶号或允许顶号——允许顶号
-			if pl.Online && pl.Conn != nil && pl.Conn != c {
-				_ = pl.Conn.Close()
+			if pl != nil {
+				break
 			}
-			pl.Conn = c
-			pl.Online = true
-			if d.Name != "" {
-				pl.Name = d.Name
+		}
+	} else {
+		// 找该玩家所在房间
+		for _, r := range hub.rooms {
+			for i, x := range r.Players {
+				if x != nil && x.ID == pid {
+					room = r
+					seat = i
+					// 保证房间持有同一指针
+					r.Players[i] = pl
+					break
+				}
 			}
-			// 临时连接只是壳，不进房间
-			temp.Online = false
-			temp.Conn = nil
-
-			broadcast(r, "player_reconnected", map[string]any{
-				"player_id": pl.ID,
-				"name":      pl.Name,
-				"seat":      seat,
-			})
-			broadcast(r, "tips", map[string]any{
-				"msg": pl.Name + " 已重新连接",
-			})
-			broadcast(r, "room", roomView(r))
-
-			// 推送完整状态给重连者
-			pushResumeState(pl, r, seat)
-			return pl
+			if room != nil {
+				break
+			}
 		}
 	}
-	reply(c, "resume_fail", map[string]any{"msg": "没有可恢复的对局，请重新进房"})
-	return nil
+
+	if pl == nil {
+		log.Printf("resume fail: unknown id=%s", pid)
+		reply(c, "resume_fail", map[string]any{"msg": "会话已失效，请重新连接"})
+		return nil
+	}
+
+	// 顶掉旧连接
+	if pl.Conn != nil && pl.Conn != c {
+		old := pl.Conn
+		pl.Conn = nil
+		go func(oc *websocket.Conn) { _ = oc.Close() }(old)
+	}
+	pl.Conn = c
+	pl.Online = true
+	if strings.TrimSpace(d.Name) != "" {
+		pl.Name = strings.TrimSpace(d.Name)
+	}
+	pl.Gold = goldForName(pl.Name)
+
+	// 临时壳：从 sessions 移除，避免 defer 误伤
+	if temp != nil && temp != pl {
+		temp.Online = false
+		temp.Conn = nil
+		if hub.sessions[temp.ID] == temp {
+			delete(hub.sessions, temp.ID)
+		}
+	}
+	hub.sessions[pl.ID] = pl
+
+	if room != nil {
+		broadcast(room, "player_reconnected", map[string]any{
+			"player_id": pl.ID,
+			"name":      pl.Name,
+			"seat":      seat,
+			"online":    true,
+		})
+		broadcast(room, "tips", map[string]any{"msg": pl.Name + " 已重新连接"})
+		broadcast(room, "room", roomView(room))
+		pushResumeState(pl, room, seat)
+		log.Printf("resume ok id=%s room=%s seat=%d", pl.ID, room.ID, seat)
+	} else {
+		// 不在房间：仍恢复同一 ID
+		reply(c, "resume_ok", map[string]any{
+			"id":      pl.ID,
+			"name":    pl.Name,
+			"gold":    pl.Gold,
+			"in_game": false,
+			"seat":    -1,
+		})
+		log.Printf("resume ok id=%s (lobby)", pl.ID)
+	}
+	return pl
 }
 
 func pushResumeState(p *Player, r *Room, seat int) {
@@ -314,6 +378,7 @@ func createRoom(p *Player, raw json.RawMessage) {
 	defer hub.mu.Unlock()
 	r := &Room{ID: id4(), Rule: d.Rule, Owner: p.ID, Players: []*Player{p}}
 	hub.rooms[r.ID] = r
+	hub.sessions[p.ID] = p
 	reply(p.Conn, "room", roomView(r))
 }
 
@@ -343,45 +408,52 @@ func joinRoom(p *Player, raw json.RawMessage) {
 			return
 		}
 	}
-	removeFromRoomsLocked(p, "leave")
+	removeFromRoomsLocked(p, "leave", p.Conn)
 	r.Players = append(r.Players, p)
+	hub.sessions[p.ID] = p
 	broadcast(r, "room", roomView(r))
 }
 
-func removeFromRoomsLocked(p *Player, reason string) {
+func removeFromRoomsLocked(p *Player, reason string, closing *websocket.Conn) {
 	for id, r := range hub.rooms {
 		for i, x := range r.Players {
 			if x.ID != p.ID {
 				continue
 			}
+			// 重连竞态：该座位已被新连接接管，旧连接的 leave 忽略
+			if closing != nil && x.Conn != nil && x.Conn != closing {
+				return
+			}
 			name := p.Name
 			seat := i
-			wasInGame := r.InGame && r.State != nil
 
-			// 对局中断线：保留座位，仅标记离线，避免牌局座位错乱
-			if wasInGame && reason == "disconnect" {
+			// 断线：一律保留座位，仅标离线（大厅/对局都可 resume）
+			if reason == "disconnect" {
 				x.Online = false
-				x.Conn = nil
+				if x.Conn == closing || x.Conn == nil {
+					x.Conn = nil
+				}
 				broadcast(r, "player_left", map[string]any{
 					"player_id": p.ID,
 					"name":      name,
 					"seat":      seat,
 					"reason":    "disconnect",
-					"in_game":   true,
+					"in_game":   r.InGame,
 					"offline":   true,
 					"owner":     r.Owner,
 				})
 				broadcast(r, "tips", map[string]any{
 					"msg": name + " 断线了，等待重连",
 				})
-				// 若正好轮到他出牌，跳过以免整桌卡住
-				if r.State != nil && r.State.Phase == "discard" && r.State.Current == seat {
+				broadcast(r, "room", roomView(r))
+				// 对局中若轮到他，跳过以免卡死
+				if r.InGame && r.State != nil && r.State.Phase == "discard" && r.State.Current == seat {
 					nextTurn(r, seat)
 				}
 				return
 			}
 
-			// 大厅离开 / 主动 leave：移除玩家
+			// 主动离开：移除
 			r.Players = append(r.Players[:i], r.Players[i+1:]...)
 			if len(r.Players) == 0 {
 				delete(hub.rooms, id)
@@ -395,14 +467,12 @@ func removeFromRoomsLocked(p *Player, reason string) {
 				"name":      name,
 				"seat":      seat,
 				"reason":    reason,
-				"in_game":   wasInGame,
+				"in_game":   r.InGame,
 				"offline":   false,
 				"owner":     r.Owner,
 			})
 			broadcast(r, "room", roomView(r))
-			if wasInGame {
-				broadcast(r, "tips", map[string]any{"msg": name + " 已离开房间"})
-			}
+			broadcast(r, "tips", map[string]any{"msg": name + " 离开了房间"})
 			return
 		}
 	}
@@ -411,17 +481,32 @@ func removeFromRoomsLocked(p *Player, reason string) {
 func leaveRoom(p *Player) {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
-	removeFromRoomsLocked(p, "leave")
+	removeFromRoomsLocked(p, "leave", p.Conn)
 }
 
-func onLeave(p *Player) {
+// onLeave closing 为正在关闭的连接；若座位已被新连接接管则不处理
+func onLeave(p *Player, closing *websocket.Conn) {
 	hub.mu.Lock()
-	p.Online = false
-	removeFromRoomsLocked(p, "disconnect")
+	if p != nil && p.Conn != nil && closing != nil && p.Conn != closing {
+		hub.mu.Unlock()
+		return
+	}
+	// 若 sessions 里已是别的指针/新连接，忽略
+	if p != nil {
+		if cur, ok := hub.sessions[p.ID]; ok && cur != nil && cur.Conn != nil && closing != nil && cur.Conn != closing {
+			hub.mu.Unlock()
+			return
+		}
+		p.Online = false
+		if p.Conn == closing {
+			p.Conn = nil
+		}
+		// 保留 sessions[p.ID]，ID 可被 resume
+	}
+	removeFromRoomsLocked(p, "disconnect", closing)
 	hub.mu.Unlock()
-	if p.Conn != nil {
-		_ = p.Conn.Close()
-		p.Conn = nil
+	if closing != nil {
+		_ = closing.Close()
 	}
 }
 func listRooms(p *Player) {
