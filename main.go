@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -591,6 +592,9 @@ func listRooms(p *Player) {
 	for _, r := range hub.rooms {
 		list = append(list, item{ID: r.ID, Rule: r.Rule, Count: len(r.Players), InGame: r.InGame})
 	}
+	sort.SliceStable(list, func(i, j int) bool {
+		return list[i].ID < list[j].ID
+	})
 	reply(p.Conn, "room_list", list)
 }
 
