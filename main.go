@@ -853,6 +853,7 @@ func doDiscard(p *Player, raw json.RawMessage) {
 	st.Phase = "wait_action"
 	st.Passed = make([]bool, len(r.Players))
 	st.NeedAct = make([]bool, len(r.Players))
+	log.Printf("discard room=%s seat=%d player=%s tile=%s hand_left=%d", r.ID, seat, p.Name, tileLabel(tile), len(st.Hands[seat]))
 	broadcast(r, "discarded", map[string]any{"seat": seat, "tile": tile})
 	reply(p.Conn, "hand", map[string]any{"hand": st.Hands[seat], "melds": st.Melds[seat]})
 	need := false
@@ -1660,6 +1661,38 @@ func roomView(r *Room) map[string]any {
 		ps = append(ps, map[string]any{"id": p.ID, "name": p.Name, "online": p.Online, "gold": p.Gold})
 	}
 	return map[string]any{"id": r.ID, "rule": r.Rule, "owner": r.Owner, "in_game": r.InGame, "players": ps}
+}
+
+func tileLabel(t universal.Tile) string {
+	switch t.Suit {
+	case universal.Wan:
+		return fmt.Sprintf("%d万", t.Num)
+	case universal.Tong:
+		return fmt.Sprintf("%d筒", t.Num)
+	case universal.Tiao:
+		return fmt.Sprintf("%d条", t.Num)
+	case universal.Feng:
+		switch t.Num {
+		case 1:
+			return "东风"
+		case 2:
+			return "南风"
+		case 3:
+			return "西风"
+		case 4:
+			return "北风"
+		}
+	case universal.Jian:
+		switch t.Num {
+		case 1:
+			return "红中"
+		case 2:
+			return "发财"
+		case 3:
+			return "白板"
+		}
+	}
+	return fmt.Sprintf("suit=%d num=%d", t.Suit, t.Num)
 }
 
 func reply(c *websocket.Conn, typ string, data any) {
